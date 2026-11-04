@@ -1,0 +1,29 @@
+# MQ-4 Enclosure Detection - Dependencies
+# Target platform: Raspberry Pi 5 (ARM Cortex-A76, aarch64) running Debian 13 (Trixie)
+# Python: 3.13+
+#
+# NOTE FOR RASPBERRY PI OS / DEBIAN USERS:
+# PyTorch (torch, torchvision) and OpenCV (cv2) are pre-installed as system packages
+# (e.g. python3-torch, python3-torchvision, python3-opencv).
+# When using a virtual environment, create it with system site packages enabled:
+#     python3 -m venv --system-site-packages .venv
+#     source .venv/bin/activate
+#     pip install -r requirements.txt
+
+# Object Detection Framework
+ultralytics>=8.3.0
+
+# Computer Vision & Image Processing
+opencv-python>=4.10.0
+pillow>=11.0.0
+
+# Deep Learning & Numerics (Inherited from system site-packages on Debian)
+torch>=2.6.0
+torchvision>=0.21.0
+numpy>=2.0.0
+
+# System Monitoring & Benchmarking
+psutil>=5.9.0
+
+# Testing
+pytest>=8.0.0

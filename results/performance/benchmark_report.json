@@ -1,0 +1,78 @@
+{
+  "timestamp": "2026-11-04 07:17:50 UTC",
+  "target_hardware": {
+    "platform": "Linux-6.18.50+rpt-rpi-2712-aarch64-with-glibc2.41",
+    "machine": "aarch64",
+    "logical_cpus": 4,
+    "total_ram_mb": 4049.1,
+    "initial_cpu_temp_c": 60.6
+  },
+  "model_metadata": {
+    "architecture": "YOLOv8n",
+    "weights_path": "/home/team5/MQ-4_Enclosure_Detection/models/best.pt",
+    "load_time_ms": 224.13,
+    "classes": {
+      "0": "Enclosure",
+      "1": "Enclosure_Bottom",
+      "2": "Enclosure_Top"
+    },
+    "num_classes": 3
+  },
+  "reference_colab_metrics": {
+    "note": "Previously recorded training-environment evaluation results on Google Colab (Held-out Test Set, N=72)",
+    "precision": "97.8%",
+    "recall": "98.7%",
+    "map50": "99.2%",
+    "map50_95": "74.8%"
+  },
+  "raspberry_pi_measured_performance": [
+    {
+      "imgsz": 320,
+      "num_runs": 10,
+      "preprocess_mean_ms": 1.81,
+      "inference_mean_ms": 279.77,
+      "postprocess_mean_ms": 1.31,
+      "total_latency_mean_ms": 283.65,
+      "total_latency_std_ms": 51.07,
+      "total_latency_p50_ms": 259.04,
+      "total_latency_p95_ms": 369.9,
+      "total_latency_min_ms": 240.83,
+      "total_latency_max_ms": 419.46,
+      "average_fps": 3.52,
+      "cpu_percent_during_run": 68.3,
+      "ram_used_mb": 2957.7
+    },
+    {
+      "imgsz": 480,
+      "num_runs": 10,
+      "preprocess_mean_ms": 2.86,
+      "inference_mean_ms": 497.28,
+      "postprocess_mean_ms": 1.15,
+      "total_latency_mean_ms": 502.13,
+      "total_latency_std_ms": 33.48,
+      "total_latency_p50_ms": 503.26,
+      "total_latency_p95_ms": 550.89,
+      "total_latency_min_ms": 437.57,
+      "total_latency_max_ms": 551.56,
+      "average_fps": 1.99,
+      "cpu_percent_during_run": 79.2,
+      "ram_used_mb": 2939.5
+    },
+    {
+      "imgsz": 640,
+      "num_runs": 10,
+      "preprocess_mean_ms": 3.32,
+      "inference_mean_ms": 813.39,
+      "postprocess_mean_ms": 1.2,
+      "total_latency_mean_ms": 818.82,
+      "total_latency_std_ms": 31.31,
+      "total_latency_p50_ms": 826.22,
+      "total_latency_p95_ms": 858.95,
+      "total_latency_min_ms": 769.99,
+      "total_latency_max_ms": 868.24,
+      "average_fps": 1.22,
+      "cpu_percent_during_run": 82.5,
+      "ram_used_mb": 3008.0
+    }
+  ]
+}
