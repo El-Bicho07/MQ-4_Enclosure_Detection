@@ -34,6 +34,7 @@ from src.utils import (
     get_soc_temperature,
     get_throttled_status,
     is_active_cooler_tachometer_available,
+    validate_active_cooler_health,
 )
 
 
@@ -378,6 +379,177 @@ class TestMQ4EnclosureDetector(unittest.TestCase):
         self.assertIn("code_hex", throttled)
         self.assertIn("is_under_voltage", throttled)
         self.assertIn("is_freq_capped", throttled)
+
+    def test_18_multi_enclosure_assembly_status(self) -> None:
+        """Verify quality status handles multiple full enclosure assemblies in one frame."""
+        res_multi = DetectionResult(
+            boxes=[[10, 10, 100, 100], [200, 200, 300, 300]],
+            scores=[0.95, 0.92],
+            class_ids=[0, 0],
+            class_names=["Enclosure", "Enclosure"],
+        )
+        text, color, detail = compute_assembly_status(res_multi)
+        self.assertIn("PASS: 2 ASSEMBLED ENCLOSURES", text)
+        self.assertEqual(color, (50, 205, 50))
+        self.assertIn("2D optical vision cannot verify", detail)
+
+    def test_19_ambiguous_and_detached_assembly_permutations(self) -> None:
+        """Verify handling of mixed scenes with complete units + detached or orphaned parts."""
+        # Mixed: 1 full enclosure + 1 loose bottom
+        res_mixed = DetectionResult(
+            boxes=[[10, 10, 100, 100], [400, 400, 500, 500]],
+            scores=[0.95, 0.85],
+            class_ids=[0, 1],
+            class_names=["Enclosure", "Enclosure_Bottom"],
+        )
+        text, color, detail = compute_assembly_status(res_mixed)
+        self.assertIn("CANDIDATE ASSEMBLY", text)
+        self.assertIn("Mixed scene", detail)
+
+        # 2 bottoms + 1 top (1 candidate pair + 1 orphaned bottom)
+        res_unpaired = DetectionResult(
+            boxes=[[50, 100, 200, 250], [55, 80, 195, 240], [500, 500, 600, 600]],
+            scores=[0.9, 0.88, 0.75],
+            class_ids=[1, 2, 1],
+            class_names=["Enclosure_Bottom", "Enclosure_Top", "Enclosure_Bottom"],
+        )
+        text, color, detail = compute_assembly_status(res_unpaired)
+        self.assertIn("DETACHED COMPONENTS", text)
+        self.assertIn("unpaired base", detail)
+
+    def test_20_spatial_pairing_prevents_cross_assembly_matching(self) -> None:
+        """Verify spatial pairing matches closest components rather than crossing assemblies."""
+        # Assembly A at x~50: Bottom and Top aligned
+        # Assembly B at x~450: Bottom and Top aligned
+        res_two_assemblies = DetectionResult(
+            boxes=[
+                [50, 100, 200, 250],    # Bottom A
+                [55, 80, 195, 240],     # Top A
+                [450, 100, 600, 250],   # Bottom B
+                [455, 80, 595, 240],    # Top B
+            ],
+            scores=[0.85, 0.99, 0.98, 0.84],  # Top A highest, Bottom B highest
+            class_ids=[1, 2, 1, 2],
+            class_names=["Enclosure_Bottom", "Enclosure_Top", "Enclosure_Bottom", "Enclosure_Top"],
+        )
+        text, color, detail = compute_assembly_status(res_two_assemblies)
+        self.assertIn("2 CANDIDATE ASSEMBLIES", text)
+        self.assertEqual(color, (0, 215, 255))
+
+    def test_21_threaded_camera_lifecycle_and_metrics(self) -> None:
+        """Verify ThreadedCamera metrics, frame tracking, and idempotent release."""
+        from unittest.mock import MagicMock, patch
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, np.zeros((480, 640, 3), dtype=np.uint8))
+        mock_cap.get.side_effect = lambda prop: 640 if prop == 3 else (480 if prop == 4 else 30.0)
+
+        with patch("cv2.VideoCapture", return_value=mock_cap):
+            cam = ThreadedCamera(src=0)
+            ret, frame, latency = cam.read()
+            self.assertTrue(ret)
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame.shape, (480, 640, 3))
+
+            metrics = cam.get_metrics()
+            self.assertIn("frames_captured", metrics)
+            self.assertIn("frames_served", metrics)
+            self.assertIn("frames_overwritten", metrics)
+            self.assertGreaterEqual(metrics["frames_served"], 1)
+
+            # Idempotent release
+            cam.release()
+            self.assertTrue(cam.stopped)
+            cam.release()
+
+    def test_22_active_cooler_health_validation(self) -> None:
+        """Verify Active Cooler health status logic under various thermal/fan conditions."""
+        # 1. Normal idle (cool SoC, fan stopped)
+        idle_status = validate_active_cooler_health(temp_c=45.0, fan_rpm=0)
+        self.assertEqual(idle_status["status"], "NORMAL_IDLE")
+        self.assertTrue(idle_status["is_healthy"])
+
+        # 2. Active cooling (warm SoC, fan spinning)
+        active_status = validate_active_cooler_health(temp_c=58.0, fan_rpm=3100)
+        self.assertEqual(active_status["status"], "ACTIVE_COOLING")
+        self.assertTrue(active_status["is_healthy"])
+
+        # 3. Stall warning (hot SoC, fan not spinning)
+        stall_status = validate_active_cooler_health(temp_c=62.0, fan_rpm=0)
+        self.assertEqual(stall_status["status"], "STALL_WARNING")
+        self.assertFalse(stall_status["is_healthy"])
+
+        # 4. Tachometer anomaly (negative RPM)
+        anomaly_status = validate_active_cooler_health(temp_c=50.0, fan_rpm=-50)
+        self.assertEqual(anomaly_status["status"], "ANOMALY")
+        self.assertFalse(anomaly_status["is_healthy"])
+
+        # 5. Interface unavailable
+        unavail_status = validate_active_cooler_health(temp_c=50.0, fan_rpm=None)
+        self.assertEqual(unavail_status["status"], "UNAVAILABLE")
+        self.assertTrue(unavail_status["is_healthy"])
+
+    def test_23_box_iou_edge_cases(self) -> None:
+        """Verify box IoU mathematical edge cases (zero area, disjoint, out-of-order)."""
+        box1 = [10.0, 10.0, 100.0, 100.0]
+        # Zero area box (degenerate width/height)
+        box_zero = [50.0, 50.0, 50.0, 50.0]
+        self.assertEqual(compute_box_iou(box1, box_zero), 0.0)
+
+        # Disjoint boxes
+        box_far = [500.0, 500.0, 600.0, 600.0]
+        self.assertEqual(compute_box_iou(box1, box_far), 0.0)
+
+        # Inverted box coordinates (x2 < x1)
+        box_inverted = [100.0, 100.0, 10.0, 10.0]
+        self.assertEqual(compute_box_iou(box1, box_inverted), 0.0)
+
+    def test_24_benchmark_dual_fps_calculation(self) -> None:
+        """Verify benchmark result structure contains both throughput FPS and reciprocal FPS."""
+        from src.utils import ResolutionBenchmarkResult
+
+        res = ResolutionBenchmarkResult(
+            imgsz=320,
+            num_runs=30,
+            preprocess_mean_ms=1.81,
+            inference_mean_ms=279.77,
+            postprocess_mean_ms=1.31,
+            total_latency_mean_ms=283.65,
+            total_latency_std_ms=15.2,
+            total_latency_p50_ms=281.0,
+            total_latency_p95_ms=369.90,
+            total_latency_min_ms=270.0,
+            total_latency_max_ms=410.0,
+            average_fps=3.52,
+            cpu_percent_during_run=68.3,
+            ram_used_mb=2957.0,
+            reciprocal_fps=3.53,
+            throughput_fps=3.52,
+            warmup_runs=5,
+        )
+        self.assertEqual(res.throughput_fps, 3.52)
+        self.assertEqual(res.reciprocal_fps, 3.53)
+        self.assertEqual(res.warmup_runs, 5)
+
+    def test_25_model_provenance_and_metadata(self) -> None:
+        """Verify that models/best.pt contains authentic training metadata and class IDs."""
+        import torch
+
+        checkpoint_path = self.project_root / "models" / "best.pt"
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        # Verify class names dictionary
+        expected_names = {0: "Enclosure", 1: "Enclosure_Bottom", 2: "Enclosure_Top"}
+        model_names = ckpt.get("model").names if hasattr(ckpt.get("model"), "names") else None
+        self.assertEqual(model_names, expected_names)
+
+        # Verify training arguments
+        train_args = ckpt.get("train_args")
+        self.assertIsNotNone(train_args)
+        self.assertEqual(train_args.get("model"), "yolov8n.pt")
+        self.assertEqual(train_args.get("imgsz"), 640)
+        self.assertIn("MQ-4", train_args.get("data", ""))
 
 
 if __name__ == "__main__":

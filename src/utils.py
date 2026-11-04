@@ -170,15 +170,90 @@ def get_throttled_status() -> Dict[str, Any]:
     }
 
 
+_DEFAULT_QUERY = object()
+
+
+def validate_active_cooler_health(
+    temp_c: Any = _DEFAULT_QUERY, fan_rpm: Any = _DEFAULT_QUERY
+) -> Dict[str, Any]:
+    """Validate Active Cooler health state against thermal expectations.
+
+    Distinguishes:
+      - UNAVAILABLE: Tachometer interface is absent.
+      - NORMAL_IDLE: SoC is cool (< 50.0°C) and fan is idle (0 RPM).
+      - ACTIVE_COOLING: Fan is actively spinning (> 0 RPM).
+      - STALL_WARNING: SoC is warm/hot (>= 55.0°C) but fan reports 0 RPM.
+      - ANOMALY: Negative or invalid tachometer values.
+
+    Args:
+        temp_c: Optional SoC temperature in Celsius. If omitted, queried automatically.
+        fan_rpm: Optional fan speed in RPM. If omitted, queried automatically.
+
+    Returns:
+        Dictionary with status ('NORMAL_IDLE', 'ACTIVE_COOLING', 'STALL_WARNING', 'UNAVAILABLE'),
+        is_healthy (bool), and diagnostic message.
+    """
+    cur_temp = get_soc_temperature() if temp_c is _DEFAULT_QUERY else temp_c
+    cur_rpm = get_active_cooler_fan_rpm() if fan_rpm is _DEFAULT_QUERY else fan_rpm
+
+    if cur_rpm is None:
+        return {
+            "status": "UNAVAILABLE",
+            "is_healthy": True,
+            "message": "Active Cooler tachometer interface is not detected on this host.",
+            "fan_rpm": None,
+            "temp_c": cur_temp,
+        }
+
+    if cur_rpm < 0:
+        return {
+            "status": "ANOMALY",
+            "is_healthy": False,
+            "message": f"Active Cooler tachometer reported invalid negative RPM: {cur_rpm}.",
+            "fan_rpm": cur_rpm,
+            "temp_c": cur_temp,
+        }
+
+    if cur_rpm > 0:
+        return {
+            "status": "ACTIVE_COOLING",
+            "is_healthy": True,
+            "message": f"Active forced-air cooling engaged at {cur_rpm} RPM (SoC: {cur_temp}°C).",
+            "fan_rpm": cur_rpm,
+            "temp_c": cur_temp,
+        }
+
+    # Fan RPM is 0
+    if cur_temp is not None and cur_temp >= 55.0:
+        return {
+            "status": "STALL_WARNING",
+            "is_healthy": False,
+            "message": f"Cooler stall warning: SoC temperature is elevated ({cur_temp:.1f}°C >= 55.0°C) but fan reports 0 RPM. Check fan PWM connection or thermal trip.",
+            "fan_rpm": 0,
+            "temp_c": cur_temp,
+        }
+
+    return {
+        "status": "NORMAL_IDLE",
+        "is_healthy": True,
+        "message": f"Normal idle: SoC is below thermal trip point ({cur_temp}°C < 50.0°C). Fan is idle (0 RPM).",
+        "fan_rpm": 0,
+        "temp_c": cur_temp,
+    }
+
+
 def get_system_telemetry() -> Dict[str, Any]:
     """Collect hardware and system telemetry metrics.
 
     Returns:
-        Dictionary of CPU, memory, OS, fan, and thermal metrics.
+        Dictionary of CPU, memory, OS, fan, thermal, and cooler health metrics.
     """
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     cpu_freq = psutil.cpu_freq()
+
+    soc_temp = get_soc_temperature()
+    fan_rpm = get_active_cooler_fan_rpm()
 
     telemetry: Dict[str, Any] = {
         "platform": platform.platform(),
@@ -194,10 +269,11 @@ def get_system_telemetry() -> Dict[str, Any]:
         "ram_available_mb": round(mem.available / (1024 * 1024), 1),
         "ram_percent": mem.percent,
         "swap_percent": swap.percent,
-        "cpu_temp_c": get_soc_temperature(),
-        "soc_temp_c": get_soc_temperature(),
-        "fan_rpm": get_active_cooler_fan_rpm(),
+        "cpu_temp_c": soc_temp,
+        "soc_temp_c": soc_temp,
+        "fan_rpm": fan_rpm,
         "tachometer_available": is_active_cooler_tachometer_available(),
+        "cooler_health": validate_active_cooler_health(temp_c=soc_temp, fan_rpm=fan_rpm),
         "throttled": get_throttled_status(),
     }
     return telemetry
@@ -278,6 +354,9 @@ class ResolutionBenchmarkResult:
     average_fps: float
     cpu_percent_during_run: float
     ram_used_mb: float
+    reciprocal_fps: float = 0.0
+    throughput_fps: float = 0.0
+    warmup_runs: int = 5
 
 
 def benchmark_model(
@@ -371,7 +450,13 @@ def benchmark_model(
         p95_total = float(np.percentile(tot_arr, 95))
         min_total = float(np.min(tot_arr))
         max_total = float(np.max(tot_arr))
-        avg_fps = float(num_runs / bench_elapsed) if bench_elapsed > 0 else 0.0
+
+        # Dual FPS calculations:
+        # 1. Throughput FPS: actual wall-clock completed iterations per second
+        throughput_fps = float(num_runs / bench_elapsed) if bench_elapsed > 0 else 0.0
+        # 2. Reciprocal Latency FPS: theoretical maximum from mean single-frame time
+        reciprocal_fps = float(1000.0 / mean_total) if mean_total > 0 else 0.0
+        avg_fps = throughput_fps
 
         current_telemetry = get_system_telemetry()
 
@@ -390,15 +475,19 @@ def benchmark_model(
             average_fps=round(avg_fps, 2),
             cpu_percent_during_run=round(float(np.mean(cpu_samples)), 1),
             ram_used_mb=current_telemetry["ram_used_mb"],
+            reciprocal_fps=round(reciprocal_fps, 2),
+            throughput_fps=round(throughput_fps, 2),
+            warmup_runs=warmup_runs,
         )
         benchmark_results.append(res_metric)
 
         logger.info(
-            "Results [%dx%d]: Mean Latency = %.2f ms | Avg FPS = %.2f | P95 = %.2f ms",
+            "Results [%dx%d]: Mean Latency = %.2f ms | Throughput FPS = %.2f | Reciprocal FPS = %.2f | P95 = %.2f ms",
             imgsz,
             imgsz,
             mean_total,
-            avg_fps,
+            throughput_fps,
+            reciprocal_fps,
             p95_total,
         )
 
@@ -433,13 +522,17 @@ def benchmark_model(
 
 
 def save_benchmark_report(
-    report: Dict[str, Any], output_dir: Optional[Path | str] = None
+    report: Dict[str, Any],
+    output_dir: Optional[Path | str] = None,
+    timestamp_suffix: bool = False,
 ) -> Tuple[Path, Path]:
     """Save benchmark results to JSON and Markdown format.
 
     Args:
         report: Dictionary generated by benchmark_model().
         output_dir: Output directory (defaults to results/performance).
+        timestamp_suffix: If True, saves to benchmark_report_YYYYMMDD_HHMMSS.{json,md}
+                          to preserve previous benchmark history without overwriting.
 
     Returns:
         Tuple of (json_path, markdown_path).
@@ -447,8 +540,13 @@ def save_benchmark_report(
     out_dir = Path(output_dir).resolve() if output_dir else DetectorConfig().performance_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    json_path = out_dir / "benchmark_report.json"
-    md_path = out_dir / "benchmark_report.md"
+    if timestamp_suffix:
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        json_path = out_dir / f"benchmark_report_{ts}.json"
+        md_path = out_dir / f"benchmark_report_{ts}.md"
+    else:
+        json_path = out_dir / "benchmark_report.json"
+        md_path = out_dir / "benchmark_report.md"
 
     # Save JSON
     with open(json_path, "w", encoding="utf-8") as f:

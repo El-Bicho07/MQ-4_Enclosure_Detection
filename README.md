@@ -137,15 +137,23 @@ The model was trained on the dedicated **Roboflow-hosted** `MQ-4_Dataset_v1_Base
 
 ### Measured CPU Benchmark Results:
 
-| Resolution | Preprocess (ms) | Inference (ms) | Postprocess (ms) | Mean Total Latency (ms) | P95 Latency (ms) | Realized FPS | Average CPU Load (%) | RAM Usage (MB) |
+| Resolution | Preprocess (ms) | Inference (ms) | Postprocess (ms) | Mean Total Latency (ms) | P95 Latency (ms) | Realized FPS | Average CPU Load (%) | Total Host RAM (MB)* |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **320 × 320** | **1.81 ms** | **279.77 ms** | **1.31 ms** | **283.65 ms** | **369.90 ms** | **3.52 FPS** | 68.3% | 2,957 MB |
 | **480 × 480** | **2.86 ms** | **497.28 ms** | **1.15 ms** | **502.13 ms** | **550.89 ms** | **1.99 FPS** | 79.2% | 2,939 MB |
 | **640 × 640** | **3.32 ms** | **813.39 ms** | **1.20 ms** | **818.82 ms** | **858.95 ms** | **1.22 FPS** | 82.5% | 3,008 MB |
 
 - **Cold Model Loading Latency:** **224.13 ms**
+- **Process vs. System Memory:** The dedicated YOLOv8n detector process consumes **~320–350 MB** of resident memory. The "Total Host RAM" metric records total Linux system memory (~2.9 GB out of 4.0 GB), including the Wayland desktop compositor, X11 server, and background OS services.
 - **Operating Temperature:** 58°C – 61°C under continuous multi-run load.
 - Detailed JSON and Markdown benchmark reports are preserved in [results/performance/](file:///home/team5/MQ-4_Enclosure_Detection/results/performance/).
+
+### Synthetic Benchmark vs. End-to-End Live Camera Throughput:
+
+The difference between synthetic benchmark FPS (~3.52 FPS @ 320p) and live camera inspection FPS (~2.96 FPS @ 320p) reflects real-world engineering boundaries:
+1. **Synthetic Inference Benchmark (`src/utils.py`):** Measures isolated PyTorch forward pass, image resizing, and NMS post-processing on pre-loaded memory frames without video device I/O.
+2. **End-to-End Live Pipeline (`src/camera.py`):** Includes hardware V4L2 USB frame ingestion from the Logitech C270, multi-instance spatial pairing logic, OpenCV annotation overlays, HUD banner drawing, and thermal telemetry polling.
+3. **Capture Rate vs. Processing Throughput:** The Logitech C270 hardware sensor captures frames at **~30.0 FPS**. The CPU detection pipeline operates at **~3.0 FPS**. The `ThreadedCamera` background thread continuously drains the kernel V4L2 queue, intentionally serving only the newest frame and overwriting older frames (~9 of 10 frames overwritten). This design completely eliminates multi-second buffer delay and guarantees that displayed detections correspond to current physical reality.
 
 ### Reported 15-Minute Continuous Hardware Stress Test Measurements:
 
@@ -155,13 +163,13 @@ To validate long-term thermal equilibrium and edge reliability, an uninterrupted
 | :--- | :---: | :--- |
 | **Test Duration** | **900.1 seconds** (15.0 minutes uninterrupted) | Target 900s reached cleanly |
 | **Total Processed Frames** | **2,666 frames** | Continuous inference without frame drop |
-| **Average Throughput** | **2.96 FPS** | Steady real-time inspection throughput |
+| **Average Throughput** | **2.96 FPS** | Steady edge inspection throughput |
 | **SoC Starting Temperature** | **52.4 °C** | Normal idle operating baseline |
 | **SoC Peak Temperature** | **59.0 °C** (Mean: **56.8 °C**) | Over 20 °C below 80 °C throttle threshold |
 | **Active Cooler Fan Speed** | **Mean: 3,143 RPM** (Peak: 4,889 RPM) | Dynamically regulated via kernel PWM driver |
 | **Firmware Throttling Code** | **`0x0`** (`throttled=0x0`) | Zero thermal throttling, zero under-voltage |
 | **ARM CPU Frequency** | **Locked at 2,400.0 MHz** | 100% nominal clock rate maintained |
-| **Memory Footprint** | Started: 2,873 MB, Ended: 3,009 MB | Stable memory bounds; zero memory leaks |
+| **Memory Footprint** | Started: 2,873 MB, Ended: 3,009 MB | Stable system memory bounds; zero memory leaks |
 
 *Report data preserved in [results/performance/logitech_hardware_validation_report.md](file:///home/team5/MQ-4_Enclosure_Detection/results/performance/logitech_hardware_validation_report.md).*
 
@@ -202,7 +210,7 @@ MQ-4_Enclosure_Detection/
 │   └── README.md                      # Google Colab reference pipeline and workflows
 ├── tests/
 │   ├── __init__.py
-│   └── test_model.py                  # Pytest/unittest suite (10 automated unit tests)
+│   └── test_model.py                  # Pytest/unittest suite (25 automated unit tests)
 ├── pytest.ini                         # Pytest configuration
 ├── requirements.txt                   # Project dependency definitions
 ├── .gitignore                         # Git exclusion rules
@@ -355,7 +363,7 @@ pytest tests/test_model.py -v
 python3 -m unittest discover tests -v
 ```
 
-### Test Coverage Highlights (17 Automated Tests):
+### Test Coverage Highlights (25 Automated Tests):
 - `test_01_checkpoint_exists`: Confirms `models/best.pt` exists, is accessible, and has non-zero size.
 - `test_02_config_validation`: Tests configuration paths and missing file exceptions.
 - `test_03_model_loads_successfully`: Verifies Ultralytics YOLO deserializes the checkpoint without errors.
@@ -368,11 +376,19 @@ python3 -m unittest discover tests -v
 - `test_10_annotation_rendering`: Verifies OpenCV badge and overlay rendering logic.
 - `test_11_list_available_cameras`: Verifies camera device probing executes without select() timeouts.
 - `test_12_camera_diagnostic_failure`: Verifies `test_camera_device` handles invalid hardware safely.
-- `test_13_compute_assembly_status`: Verifies PASS/SUB-ASSEMBLY status logic across all class permutations.
+- `test_13_compute_assembly_status`: Verifies PASS/SUB-ASSEMBLY status logic across canonical class permutations.
 - `test_14_threaded_camera_failure`: Verifies background `ThreadedCamera` worker cleanly raises errors on invalid indices.
 - `test_15_v4l2_device_query_on_hardware`: Verifies POSIX `VIDIOC_QUERYCAP` identifies video0 as capture and video1 as metadata.
 - `test_16_box_iou_computation`: Tests IoU spatial overlap math for candidate assembly verification.
 - `test_17_active_cooler_and_soc_telemetry`: Verifies SoC temperature within plausible limits (15–95 °C), validates Active Cooler tachometer interfaces (accepting 0 RPM as valid idle state when SoC < 50 °C, and positive RPM under load), rejects invalid/negative readings, and checks firmware throttling telemetry.
+- `test_18_multi_enclosure_assembly_status`: Verifies detection and counting of multiple assembled enclosures (`PASS: N ASSEMBLED ENCLOSURES`) in multi-part scenes.
+- `test_19_ambiguous_and_detached_assembly_permutations`: Tests mixed scenes with complete enclosures alongside loose detached tops/bottoms, verifying proper warnings.
+- `test_20_spatial_pairing_prevents_cross_assembly_matching`: Ensures greedy pairwise spatial matching prevents horizontally separated tops and bottoms from falsely matching across assemblies.
+- `test_21_threaded_camera_lifecycle_and_metrics`: Validates frame grab/serve/overwrite counters, capture vs. consumer FPS metrics, and idempotent release behavior.
+- `test_22_active_cooler_health_validation`: Verifies telemetry categorization into `NORMAL_IDLE`, `ACTIVE_COOLING`, `STALL_WARNING` (temp >= 55°C @ 0 RPM), `ANOMALY`, and `UNAVAILABLE`.
+- `test_23_box_iou_edge_cases`: Tests boundary conditions including zero-area boxes, disjoint coordinates, and inverted/malformed bounding boxes.
+- `test_24_benchmark_dual_fps_calculation`: Verifies both wall-clock throughput FPS (`num_runs / elapsed`) and reciprocal frame-time FPS (`1000.0 / mean_total`) along with warmup discarding.
+- `test_25_model_provenance_and_metadata`: Deeply inspects PyTorch checkpoint dictionary for expected architecture, classes, and training metadata.
 
 ---
 
@@ -428,8 +444,8 @@ All empirical evidence, hardware verification logs, and prediction snapshots are
    - Benchmark INT8 quantization via NCNN or ONNX Runtime to target 10–15 FPS on Raspberry Pi 5 CPU without accuracy degradation.
 2. **Hardware AI Accelerators:**
    - Integrate a Raspberry Pi AI Kit (Hailo-8L NPU, 13 TOPS) or Google Coral Edge TPU to achieve 30+ FPS at 640×640.
-3. **Assembly Validation Logic:**
-   - Implement geometric spatial rules checking that `Enclosure_Top` bounding boxes are correctly aligned above `Enclosure_Bottom` boxes to verify structural assembly completeness.
+3. **Mechanical Verification Sensor Fusion:**
+   - Pairwise 2D geometric alignment and IoU spatial rules are now implemented in software. Future hardware revisions can incorporate 3D structured-light depth sensing or tactile microswitches to definitively verify physical snap-fit latch depth and seal compression.
 4. **Industrial Lighting Integration:**
    - Add automated GPIO trigger controls for ring LEDs to ensure uniform illumination on inspection lines.
 

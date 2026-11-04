@@ -262,7 +262,9 @@ class ThreadedCamera:
         self.ret = False
         self.frame: Optional[np.ndarray] = None
         self.grab_count = 0
+        self.served_count = 0
         self.latest_grab_timestamp = 0.0
+        self.start_time = time.perf_counter()
 
         # Prime initial frame
         self.ret, self.frame = self.cap.read()
@@ -277,16 +279,21 @@ class ThreadedCamera:
     def _worker(self) -> None:
         """Background loop continuously polling newest camera frame."""
         while not self.stopped:
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.ret = ret
-                if ret and frame is not None:
-                    self.frame = frame
-                    self.grab_count += 1
-                    self.latest_grab_timestamp = time.perf_counter()
-                else:
-                    self.stopped = True
-                    break
+            try:
+                ret, frame = self.cap.read()
+                with self.lock:
+                    self.ret = ret
+                    if ret and frame is not None:
+                        self.frame = frame
+                        self.grab_count += 1
+                        self.latest_grab_timestamp = time.perf_counter()
+                    else:
+                        self.stopped = True
+                        break
+            except Exception as exc:
+                logger.error("Exception in ThreadedCamera worker loop: %s", exc)
+                self.stopped = True
+                break
 
     def read(self) -> Tuple[bool, Optional[np.ndarray], float]:
         """Return the most recently acquired frame and its acquisition latency.
@@ -297,17 +304,37 @@ class ThreadedCamera:
         t0 = time.perf_counter()
         with self.lock:
             if self.frame is not None:
+                self.served_count += 1
                 frame_out = self.frame.copy()
                 grab_latency_ms = (time.perf_counter() - t0) * 1000.0
                 return self.ret, frame_out, grab_latency_ms
             return self.ret, None, 0.0
 
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return frame rate, grab count, and overwrite statistics."""
+        with self.lock:
+            elapsed = time.perf_counter() - self.start_time
+            cap_fps = round(self.grab_count / elapsed, 2) if elapsed > 0 else 0.0
+            srv_fps = round(self.served_count / elapsed, 2) if elapsed > 0 else 0.0
+            overwritten = max(0, self.grab_count - self.served_count)
+            return {
+                "frames_captured": self.grab_count,
+                "frames_served": self.served_count,
+                "frames_overwritten": overwritten,
+                "capture_fps": cap_fps,
+                "consumer_fps": srv_fps,
+                "is_alive": self.thread.is_alive() and not self.stopped,
+            }
+
     def release(self) -> None:
         """Stop background reader and release video capture resources."""
+        if self.stopped and not (hasattr(self, "cap") and self.cap.isOpened()):
+            return
         self.stopped = True
-        if self.thread.is_alive():
+        if hasattr(self, "thread") and self.thread.is_alive():
             self.thread.join(timeout=1.0)
-        self.cap.release()
+        if hasattr(self, "cap") and self.cap.isOpened():
+            self.cap.release()
 
 
 def compute_box_iou(box1: List[float], box2: List[float]) -> float:
@@ -332,8 +359,9 @@ def compute_assembly_status(result: DetectionResult) -> Tuple[str, Tuple[int, in
     """Evaluate enclosure assembly status considering class identities and spatial relationships.
 
     CRITICAL QUALITY CONTROL NOTE:
-    Optical 2D object detection cannot guarantee internal mechanical clip latching
-    or seal integrity. It evaluates visual alignment and component co-presence only.
+    Optical 2D object detection cannot guarantee internal mechanical clip latching,
+    gasket compression, seal integrity, or screw torque. It evaluates visual alignment
+    and component co-presence only.
 
     Args:
         result: DetectionResult from YOLO inference.
@@ -341,66 +369,137 @@ def compute_assembly_status(result: DetectionResult) -> Tuple[str, Tuple[int, in
     Returns:
         Tuple of (status_title, BGR_badge_color, detailed_diagnostic_string).
     """
-    has_full = any(cls_id == 0 for cls_id in result.class_ids)
+    DISCLAIMER = "2D optical vision cannot verify mechanical snap-fit clip engagement, seal compression, or screw torque."
+
+    if result.is_empty:
+        return (
+            "READY: NO ENCLOSURE DETECTED",
+            (160, 160, 160),  # Neutral Grey
+            f"Inspection workstation clear. Place unit in camera field of view. | {DISCLAIMER}",
+        )
+
+    full_indices = [i for i, cid in enumerate(result.class_ids) if cid == 0]
     bottom_indices = [i for i, cid in enumerate(result.class_ids) if cid == 1]
     top_indices = [i for i, cid in enumerate(result.class_ids) if cid == 2]
 
-    # Primary case: Assembled unit detected as single monolithic assembly
-    if has_full:
-        full_idx = result.class_ids.index(0)
-        conf = result.scores[full_idx] * 100.0
-        return (
-            "PASS: ASSEMBLED ENCLOSURE (OPTICAL)",
-            (50, 205, 50),  # Green
-            f"Class 0 detected ({conf:.1f}% conf). Visual assembly verified.",
-        )
+    num_full = len(full_indices)
+    num_bottoms = len(bottom_indices)
+    num_tops = len(top_indices)
 
-    # Secondary case: Both base and top sub-components detected in frame
-    if bottom_indices and top_indices:
-        # Check spatial proximity between best bottom and top
-        best_b_idx = max(bottom_indices, key=lambda i: result.scores[i])
-        best_t_idx = max(top_indices, key=lambda i: result.scores[i])
+    # 1. Multi-instance spatial pairing for subcomponents (Bottom + Top)
+    paired_bottoms = set()
+    paired_tops = set()
+    aligned_pairs = []
 
-        box_b = result.boxes[best_b_idx]
-        box_t = result.boxes[best_t_idx]
-        iou = compute_box_iou(box_b, box_t)
+    # Score and rank candidate pairs (bottom, top)
+    candidate_pairs = []
+    for b_idx in bottom_indices:
+        box_b = result.boxes[b_idx]
+        b_w = max(1.0, box_b[2] - box_b[0])
+        b_cy = (box_b[1] + box_b[3]) / 2.0
+        b_cx = (box_b[0] + box_b[2]) / 2.0
 
-        # Check vertical arrangement: Top cap should sit above or overlap with base plate
-        b_center_y = (box_b[1] + box_b[3]) / 2.0
-        t_center_y = (box_t[1] + box_t[3]) / 2.0
+        for t_idx in top_indices:
+            box_t = result.boxes[t_idx]
+            t_cy = (box_t[1] + box_t[3]) / 2.0
+            t_cx = (box_t[0] + box_t[2]) / 2.0
+            iou = compute_box_iou(box_b, box_t)
 
-        if iou > 0.15 or (t_center_y < b_center_y and iou > 0.02):
+            # Spatial arrangement check: Cap sits above or overlaps base plate and is horizontally centered
+            h_aligned = abs(t_cx - b_cx) < (b_w * 0.7)
+            is_vertically_aligned = (t_cy < b_cy) and h_aligned
+
+            if iou > 0.15 or (is_vertically_aligned and iou > 0.02):
+                alignment_score = iou + (0.5 if is_vertically_aligned else 0.0)
+                candidate_pairs.append((alignment_score, b_idx, t_idx, iou))
+
+    # Match greedily by alignment score descending
+    candidate_pairs.sort(key=lambda p: p[0], reverse=True)
+    for score, b_idx, t_idx, iou in candidate_pairs:
+        if b_idx not in paired_bottoms and t_idx not in paired_tops:
+            paired_bottoms.add(b_idx)
+            paired_tops.add(t_idx)
+            aligned_pairs.append((b_idx, t_idx, iou))
+
+    num_aligned_pairs = len(aligned_pairs)
+    unpaired_bottoms = num_bottoms - len(paired_bottoms)
+    unpaired_tops = num_tops - len(paired_tops)
+
+    # Decision Matrix:
+    # Case A: Monolithic Assembled Enclosure (Class 0)
+    if num_full > 0:
+        if unpaired_bottoms == 0 and unpaired_tops == 0 and num_aligned_pairs == 0:
+            if num_full == 1:
+                conf = result.scores[full_indices[0]] * 100.0
+                return (
+                    "PASS: ASSEMBLED ENCLOSURE (OPTICAL)",
+                    (50, 205, 50),  # Green
+                    f"Class 0 detected ({conf:.1f}% conf). Visual assembly verified. | {DISCLAIMER}",
+                )
+            else:
+                return (
+                    f"PASS: {num_full} ASSEMBLED ENCLOSURES (OPTICAL)",
+                    (50, 205, 50),  # Green
+                    f"{num_full} full enclosures detected. All units visually complete. | {DISCLAIMER}",
+                )
+        else:
+            # Full enclosure present, but additional loose or candidate parts detected
             return (
                 "NOTICE: CANDIDATE ASSEMBLY (VERIFY LATCH)",
                 (0, 215, 255),  # Gold
-                f"Base and Cap spatially aligned (IoU: {iou:.2f}). Check physical snap-fit.",
+                f"Mixed scene: {num_full} assembled unit(s), {num_bottoms} base(s), {num_tops} cap(s). Verify physical snap-fit. | {DISCLAIMER}",
             )
-        else:
+
+    # Case B: Subcomponents (Bottom and Top both present)
+    if num_bottoms > 0 and num_tops > 0:
+        if num_aligned_pairs > 0 and unpaired_bottoms == 0 and unpaired_tops == 0:
+            mean_iou = sum(p[2] for p in aligned_pairs) / len(aligned_pairs)
+            if num_aligned_pairs == 1:
+                return (
+                    "NOTICE: CANDIDATE ASSEMBLY (VERIFY LATCH)",
+                    (0, 215, 255),  # Gold
+                    f"Base and Cap spatially aligned (IoU: {mean_iou:.2f}). Check physical snap-fit. | {DISCLAIMER}",
+                )
+            else:
+                return (
+                    f"NOTICE: {num_aligned_pairs} CANDIDATE ASSEMBLIES (VERIFY LATCH)",
+                    (0, 215, 255),  # Gold
+                    f"{num_aligned_pairs} aligned base/cap pairs detected (Mean IoU: {mean_iou:.2f}). Check physical snap-fit. | {DISCLAIMER}",
+                )
+        elif num_aligned_pairs > 0 and (unpaired_bottoms > 0 or unpaired_tops > 0):
             return (
                 "WARN: DETACHED COMPONENTS IN FRAME",
                 (0, 165, 255),  # Orange
-                f"Base & Cap visible but unaligned (IoU: {iou:.2f}). Assembly incomplete.",
+                f"{num_aligned_pairs} candidate pair(s) plus {unpaired_bottoms} unpaired base(s) and {unpaired_tops} unpaired cap(s). Assembly incomplete. | {DISCLAIMER}",
+            )
+        else:
+            # Both present but zero aligned pairs
+            return (
+                "WARN: DETACHED COMPONENTS IN FRAME",
+                (0, 165, 255),  # Orange
+                f"Base & Cap visible but unaligned. Assembly incomplete. | {DISCLAIMER}",
             )
 
-    # Sub-component cases
-    if bottom_indices:
+    # Case C: Only Bottoms present
+    if num_bottoms > 0:
         return (
             "SUB-ASSEMBLY: ENCLOSURE_BOTTOM ONLY",
             (255, 180, 0),  # Cyan
-            "Lower base plate present; top protective cap is missing.",
+            f"{num_bottoms} lower base plate(s) present; top protective cap is missing. | {DISCLAIMER}",
         )
 
-    if top_indices:
+    # Case D: Only Tops present
+    if num_tops > 0:
         return (
             "SUB-ASSEMBLY: ENCLOSURE_TOP ONLY",
             (0, 140, 255),  # Amber
-            "Top cap present; lower mounting base is missing.",
+            f"{num_tops} top cap(s) present; lower mounting base is missing. | {DISCLAIMER}",
         )
 
     return (
         "READY: NO ENCLOSURE DETECTED",
         (160, 160, 160),  # Neutral Grey
-        "Inspection workstation clear. Place unit in camera field of view.",
+        f"Inspection workstation clear. | {DISCLAIMER}",
     )
 
 
